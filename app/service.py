@@ -7,8 +7,10 @@ import json
 import math
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from .db import get_conn, get_default_duration_seconds, get_default_lease_seconds
 
@@ -344,7 +346,15 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
     return get_dag(dag_id)
 
 
-# ---------------------------------------------------------------- 原子领取
+# ---------------------------------------------------------------- 领取裁决内核
+#
+# 不可变批次计划（ClaimPlan）是 /tasks/claim 与 /tasks/claim-plan 共用的裁决结果：
+# build_claim_plan 在单个事务的一致快照上一次性算出计划，统一记录稳定顺序
+# （rowid）下的选中项、每个未选中 pending 任务的首个阻塞原因（门控顺序：
+# 依赖 → 退避 → 并发组容量 → 能力 → 本批限额）与并发组即时占位结果（同批选中
+# 立即计入占用）。/tasks/claim-plan 只序列化该计划（serialize_claim_plan）；
+# /tasks/claim 在 BEGIN IMMEDIATE 事务内应用同一计划（apply_claim_plan），
+# 生成令牌、attempt 与事件；任一写入前置状态不匹配即整体回滚，不得部分领取。
 
 # 可领取候选行（依赖门控），按 rowid 稳定排序（同事务插入的任务 created_at
 # 可能相同，rowid 严格递增且全局唯一，适合作为键集翻页游标）。领取端按此顺序
@@ -424,40 +434,112 @@ def _load_group_snapshot(conn, now_iso: str) -> tuple[dict[str, int], dict[str, 
     return limits, occupied
 
 
-def _scan_claimable_candidates(
+# ------------------------------------------------------- 不可变批次计划
+
+@dataclass(frozen=True)
+class PlanSelection:
+    """计划中的一个选中项：候选任务的只读行快照与派生量。
+
+    row 为候选扫描时的 tasks 行（sqlite3.Row，本身只读）；required 为去重后的
+    能力标签；attempt_no 为落库后的新尝试序号；expires 为按计划时刻
+    （evaluated_at）+ lease_seconds 计算的租约过期时刻。
+    """
+
+    row: Any
+    required: tuple[str, ...]
+    attempt_no: int
+    expires: datetime
+
+
+@dataclass(frozen=True)
+class PlanBlocker:
+    """未选中 pending 任务的首个阻塞原因（按门控顺序裁决）及相关字段。"""
+
+    task_id: str
+    dag_id: str
+    task_key: str
+    name: str
+    reason: str
+    extra: Mapping[str, Any]
+
+    @classmethod
+    def of(cls, row, reason: str, extra: dict[str, Any]) -> "PlanBlocker":
+        return cls(
+            task_id=row["id"],
+            dag_id=row["dag_id"],
+            task_key=row["task_key"],
+            name=row["name"],
+            reason=reason,
+            extra=MappingProxyType(dict(extra)),
+        )
+
+
+@dataclass(frozen=True)
+class ClaimPlan:
+    """不可变批次计划：选中项、未选中阻塞原因与并发组即时占位结果的统一记录。
+
+    group_occupancy 为本批即时占位后的全库组占用（组名 -> 未过期 running 租约数，
+    含本批选中项的占位）。构建完成后计划不再变化：/tasks/claim 应用它落库，
+    /tasks/claim-plan 序列化它返回。
+    """
+
+    worker_id: str | None
+    dag_id: str | None
+    limit: int
+    evaluated_at: str
+    selected: tuple[PlanSelection, ...]
+    unselected: tuple[PlanBlocker, ...]
+    group_occupancy: Mapping[str, int]
+
+
+# 阻塞原因码 -> 人类可读说明（首个阻塞原因按门控顺序：
+# 依赖 → 退避 → 并发组容量 → 能力 → 本批限额）
+_PLAN_REASON_MESSAGES = {
+    "dependency_not_succeeded": "仍有前置任务未处于 succeeded",
+    "backoff_not_elapsed": "显式失败后的退避时刻尚未到达",
+    "concurrency_group_full": "并发组容量已满（含本批次模拟选中的即时占用）",
+    "capability_mismatch": "工作器存活登记的能力不覆盖任务要求的全部标签",
+    "limit_reached": "本次批量领取的 limit 个名额已全部选中",
+}
+
+
+def build_claim_plan(
     conn,
     *,
-    dag_id: str | None,
-    now: datetime,
-    now_iso: str,
-    limit: int,
     worker_id: str | None,
-    worker_caps: set[str] | None,
-    limits: dict[str, int],
-    occupied: dict[str, int],
-    on_select,
-    collect_skips: bool = False,
-    on_skip=None,
-) -> int:
-    """真实领取与预演共用的候选扫描裁决：候选排序、依赖/退避（SQL）、并发组
-    容量、能力门控与同批即时占位全部在此，保证两条路径的裁决口径逐候选一致。
+    dag_id: str | None,
+    limit: int,
+    now: datetime,
+) -> ClaimPlan:
+    """领取裁决内核：在调用方当前事务的一致快照上构建不可变批次计划（纯读取）。
 
-    候选按 _CLAIMABLE_PAGE_SQL 的 rowid 顺序键集翻页。对每个候选：
-      - 并发组已满（本批新选中的任务已即时计入 occupied）→ 跳过；
-      - requires 非空且无存活登记 → 409（与真实领取同语义，整批无结果）；
-      - requires 非空但能力不覆盖 → 跳过；
-      - 其余门控通过：批量已满（仅 collect_skips 时可能）记为限额阻塞，
-        否则调用 on_select（返回 False 表示该候选未落位，不计占用不计数）。
+    候选排序（rowid 键集翻页）、依赖/退避（SQL 内过滤）、并发组容量（同批即时
+    占位）、能力门控与 limit 裁决全部在此完成；/tasks/claim 与
+    /tasks/claim-plan 随后分别应用/序列化同一份计划，裁决口径逐候选一致。
+    本函数不执行任何写入，可在 PRAGMA query_only 的只读连接上运行。
 
-    collect_skips=False（真实领取）：选中 limit 个即停止翻页，与历史行为一致。
-    collect_skips=True（预演）：继续扫描全部候选，通过 on_skip 记录每个未选中
-    候选的首个阻塞原因（concurrency_group_full / capability_mismatch /
-    limit_reached），依赖与退避阻塞的 pending 任务不在候选集内，由调用方另行判定。
-    返回已选中（落位）的候选数。
+    dag_id 不存在抛 404 dag_not_found；批量填满前遇到其余门控均满足的
+    requires 候选而领取者无存活能力登记时，抛 409 worker_not_registered
+    （与历史真实领取语义一致：整批无结果）。
     """
+    now_iso = _iso(now)
+    if dag_id is not None and not conn.execute(
+        "SELECT 1 FROM dags WHERE id = ?", (dag_id,)
+    ).fetchone():
+        raise APIError(404, "dag_not_found", f"DAG {dag_id} 不存在")
+
+    # 能力路由与并发组快照：与依赖、退避一样取同一事务内的一致状态。
+    # worker 为 None（匿名）、登记缺失或已过期时 worker_caps 为 None：
+    # 遇到其余门控均满足的 requires 候选即裁决为 409。
+    worker_caps = _load_worker_caps(conn, worker_id, now_iso)
+    limits, occupied = _load_group_snapshot(conn, now_iso)
+
+    selected: list[PlanSelection] = []
+    # 候选扫描产生的跳过原因（task_id -> 阻塞项）；最终只输出仍为 pending 的任务
+    skips: dict[str, PlanBlocker] = {}
+
     after_rowid: int | None = None
-    selected = 0
-    while collect_skips or selected < limit:
+    while True:
         rows = conn.execute(
             _CLAIMABLE_PAGE_SQL,
             {
@@ -472,218 +554,98 @@ def _scan_claimable_candidates(
 
         for row in rows:
             after_rowid = row["rowid"]
-            required = json.loads(row["requires"]) if row["requires"] else []
+            required = tuple(json.loads(row["requires"])) if row["requires"] else ()
 
             # 并发组容量与依赖/退避同属「该候选此刻是否可领取」的门控（依赖、
-            # 退避已在 SQL 内过滤；组容量在 Python 侧逐候选跳过）。组已满的
-            # 候选对任何领取者都不可得，先于能力门控跳过。
+            # 退避已在 SQL 内过滤；组容量在此逐候选裁决）。组已满的候选对任何
+            # 领取者都不可得，先于能力门控跳过；同批选中项已即时计入 occupied。
             group = row["concurrency_group"]
             if group is not None and occupied.get(group, 0) >= limits[group]:
-                if collect_skips:
-                    on_skip(
-                        row,
-                        "concurrency_group_full",
-                        {
-                            "concurrency_group": group,
-                            "group_limit": limits[group],
-                            "group_occupied": occupied.get(group, 0),
-                        },
-                    )
+                skips[row["id"]] = PlanBlocker.of(
+                    row,
+                    "concurrency_group_full",
+                    {
+                        "concurrency_group": group,
+                        "group_limit": limits[group],
+                        "group_occupied": occupied.get(group, 0),
+                    },
+                )
                 continue
 
-            # 能力门控（在同事务内核验登记，与依赖/退避/并发组一起裁决）：
-            # 声明了 requires 的候选要求领取者持有存活登记且覆盖全部标签。
+            # 能力门控：声明了 requires 的候选要求领取者持有存活登记且覆盖全部标签。
             if required:
                 if worker_caps is None:
-                    if selected < limit:
+                    if len(selected) < limit:
                         # 登记缺失或已过期（含匿名领取）且该候选在批量填满之前被
                         # 遇到、其余门控均已满足：整次领取 409 且不领取任何任务——
-                        # 预演同样直接返回 409（真实领取扫描到这里也必失败）。
+                        # 预演同样直接返回 409（真实领取应用同一计划也必失败）。
                         raise APIError(
                             409,
                             "worker_not_registered",
                             "要求能力的任务只能由持有存活能力登记的工作器领取",
                             {
                                 "worker_id": worker_id,
-                                "requires": required,
+                                "requires": list(required),
                                 "task_id": row["id"],
                                 "task_key": row["task_key"],
                                 "dag_id": row["dag_id"],
                             },
                         )
-                    # 批量已填满后才遇到的候选：真实领取此刻已结束扫描、不会 409。
-                    # 预演中标记为「本批名额已满」（若用更大 limit 则会触发同样的 409）。
-                    if collect_skips:
-                        on_skip(row, "limit_reached", {"limit": limit})
+                    # 批量已填满后才遇到的候选：真实领取此刻已结束扫描、不会 409，
+                    # 记为「本批名额已满」（若用更大 limit 则会触发同样的 409）。
+                    skips[row["id"]] = PlanBlocker.of(row, "limit_reached", {"limit": limit})
                     continue
                 if not set(required) <= worker_caps:
-                    # 登记存活但能力不覆盖：跳过该候选，继续向后寻找其他任务，
-                    # 不消耗并发组名额。
-                    if collect_skips:
-                        on_skip(
-                            row,
-                            "capability_mismatch",
-                            {"requires": required, "capabilities": sorted(worker_caps)},
-                        )
+                    # 登记存活但能力不覆盖：跳过该候选，不消耗并发组名额
+                    skips[row["id"]] = PlanBlocker.of(
+                        row,
+                        "capability_mismatch",
+                        {"requires": list(required), "capabilities": sorted(worker_caps)},
+                    )
                     continue
 
-            attempt_no = row["attempt"] + 1
-            expires = now + timedelta(seconds=row["lease_seconds"])
-
-            if selected >= limit:
-                # 预演模式下批量已满：后续通过全部门控的候选只因本批限额未被选中。
-                # 不模拟占用（真实领取此刻已结束，不会再增加组占用）。
-                if collect_skips:
-                    on_skip(row, "limit_reached", {"limit": limit})
+            if len(selected) >= limit:
+                # 本批名额已满：后续通过全部门控的候选只因限额未被选中，
+                # 不再模拟占位（真实领取此刻已结束，不会再增加组占用）。
+                skips[row["id"]] = PlanBlocker.of(row, "limit_reached", {"limit": limit})
                 continue
 
-            if on_select(row, required, attempt_no, expires) is False:
-                # 真实领取的防御路径：UPDATE 未命中（被并发事务改动）则放弃本候选
-                continue
-
+            selected.append(
+                PlanSelection(
+                    row=row,
+                    required=required,
+                    attempt_no=row["attempt"] + 1,
+                    expires=now + timedelta(seconds=row["lease_seconds"]),
+                )
+            )
             if group is not None:
                 # 立即占位：同批后续候选必须看到该占用，杜绝超额
                 occupied[group] = occupied.get(group, 0) + 1
-            selected += 1
-            if not collect_skips and selected >= limit:
-                break
 
         if len(rows) < _CLAIM_PAGE_SIZE:
             break
 
-    return selected
+    unselected = _plan_unselected_blockers(
+        conn, dag_id=dag_id, now_iso=now_iso, selected=selected, skips=skips
+    )
+
+    return ClaimPlan(
+        worker_id=worker_id,
+        dag_id=dag_id,
+        limit=limit,
+        evaluated_at=now_iso,
+        selected=tuple(selected),
+        unselected=tuple(unselected),
+        group_occupancy=MappingProxyType(dict(occupied)),
+    )
 
 
-def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[str, Any]:
-    if dag_id is not None:
-        with get_conn() as conn:
-            if not conn.execute("SELECT 1 FROM dags WHERE id = ?", (dag_id,)).fetchone():
-                raise APIError(404, "dag_not_found", f"DAG {dag_id} 不存在")
-
-    claimed: list[dict[str, Any]] = []
-    now = _now()
-    now_iso = _iso(now)
-
-    with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")  # 保留锁：同一时刻只有一个领取者
-        try:
-            # 能力路由：领取者的能力登记必须在同一保留事务内核验（与依赖、退避、
-            # 并发组规则一样取同一事务内的一致状态）。worker 为 None 表示匿名领取；
-            # 登记缺失或过期时 worker_caps 为 None：遇到要求能力的候选即 409。
-            worker_caps = _load_worker_caps(conn, worker_id, now_iso)
-            limits, occupied = _load_group_snapshot(conn, now_iso)
-
-            def on_select(row, required: list[str], attempt_no: int, expires: datetime) -> bool:
-                token = uuid.uuid4().hex
-
-                # 旧尝试（若存在）标记过期，保证历史尝试不再有效
-                conn.execute(
-                    "UPDATE attempts SET state = 'expired' WHERE task_id = ? AND state = 'active'",
-                    (row["id"],),
-                )
-                cur = conn.execute(
-                    """UPDATE tasks
-                       SET state = 'running', attempt = ?, lease_token = ?,
-                           lease_expires_at = ?, worker_id = ?, started_at = COALESCE(started_at, ?),
-                           next_eligible_at = NULL
-                       WHERE id = ?""",
-                    (attempt_no, token, _iso(expires), worker_id, now_iso, row["id"]),
-                )
-                if cur.rowcount != 1:  # 被并发事务改动则放弃本任务
-                    return False
-                conn.execute(
-                    """INSERT INTO attempts (task_id, attempt_no, lease_token, worker_id,
-                           leased_at, expires_at, state)
-                       VALUES (?, ?, ?, ?, ?, ?, 'active')""",
-                    (row["id"], attempt_no, token, worker_id, now_iso, _iso(expires)),
-                )
-                # task.claimed 与领取状态变更同事务；attempt=0 为首次领取，否则为过期重领
-                _append_event(
-                    conn,
-                    EVT_TASK_CLAIMED,
-                    row["dag_id"],
-                    now_iso,
-                    task_id=row["id"],
-                    attempt=attempt_no,
-                    from_state=PENDING if row["attempt"] == 0 else row["state"],
-                    to_state=RUNNING,
-                )
-                claimed.append(
-                    {
-                        "task_id": row["id"],
-                        "dag_id": row["dag_id"],
-                        "task_key": row["task_key"],
-                        "name": row["name"],
-                        "payload": json.loads(row["payload"]) if row["payload"] else None,
-                        "attempt": attempt_no,
-                        "lease_token": token,
-                        "lease_expires_at": _iso(expires),
-                        "lease_seconds": row["lease_seconds"],
-                        "concurrency_group": row["concurrency_group"],
-                        "requires": required,
-                    }
-                )
-                return True
-
-            _scan_claimable_candidates(
-                conn,
-                dag_id=dag_id,
-                now=now,
-                now_iso=now_iso,
-                limit=limit,
-                worker_id=worker_id,
-                worker_caps=worker_caps,
-                limits=limits,
-                occupied=occupied,
-                on_select=on_select,
-            )
-
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-
-    return {"claimed": claimed, "count": len(claimed)}
-
-
-# ---------------------------------------------------------------- 领取预演（只读）
-
-# 预演阻塞原因码 -> 人类可读说明（首个阻塞原因按门控顺序：
-# 依赖 → 退避 → 并发组容量 → 能力 → 本批限额）
-_PLAN_REASON_MESSAGES = {
-    "dependency_not_succeeded": "仍有前置任务未处于 succeeded",
-    "backoff_not_elapsed": "显式失败后的退避时刻尚未到达",
-    "concurrency_group_full": "并发组容量已满（含本批次模拟选中的即时占用）",
-    "capability_mismatch": "工作器存活登记的能力不覆盖任务要求的全部标签",
-    "limit_reached": "本次批量领取的 limit 个名额已全部选中",
-}
-
-
-def _plan_selected_dict(row, required: list[str], attempt_no: int, expires: datetime) -> dict[str, Any]:
-    """模拟选中任务的对外视图：与真实领取响应同构，但不携带租约令牌（预演不发令牌）。"""
-    return {
-        "task_id": row["id"],
-        "dag_id": row["dag_id"],
-        "task_key": row["task_key"],
-        "name": row["name"],
-        "payload": json.loads(row["payload"]) if row["payload"] else None,
-        "attempt": attempt_no,
-        # 预演不产生真实租约：lease_token 缺省；lease_expires_at 仅为按当前
-        # lease_seconds 模拟的结果，真实领取时刻不同会得到不同值
-        "lease_token": None,
-        "lease_expires_at": _iso(expires),
-        "lease_seconds": row["lease_seconds"],
-        "concurrency_group": row["concurrency_group"],
-        "requires": required,
-    }
-
-
-def _plan_pending_blocker(
+def _pending_blocker(
     row,
     now_iso: str,
     task_states: dict[tuple[str, str], str],
     deps_by_task: dict[tuple[str, str], list[str]],
-) -> dict[str, Any] | None:
+) -> PlanBlocker | None:
     """判定不在可领取候选集内的 pending 任务的首个阻塞原因。
 
     候选 SQL 只按「依赖未满足」「退避未到期」两类过滤 pending 行，因此此处按
@@ -698,149 +660,247 @@ def _plan_pending_blocker(
         if task_states.get((row["dag_id"], key)) != SUCCEEDED
     ]
     if blocking:
-        return {
-            "task_id": row["id"],
-            "dag_id": row["dag_id"],
-            "task_key": row["task_key"],
-            "name": row["name"],
-            "reason": "dependency_not_succeeded",
-            "message": _PLAN_REASON_MESSAGES["dependency_not_succeeded"],
-            "blocked_by": blocking,
-        }
+        return PlanBlocker.of(row, "dependency_not_succeeded", {"blocked_by": blocking})
     if row["next_eligible_at"] is not None and row["next_eligible_at"] > now_iso:
-        return {
-            "task_id": row["id"],
-            "dag_id": row["dag_id"],
-            "task_key": row["task_key"],
-            "name": row["name"],
-            "reason": "backoff_not_elapsed",
-            "message": _PLAN_REASON_MESSAGES["backoff_not_elapsed"],
-            "next_eligible_at": row["next_eligible_at"],
-        }
+        return PlanBlocker.of(
+            row, "backoff_not_elapsed", {"next_eligible_at": row["next_eligible_at"]}
+        )
     return None
 
+
+def _plan_unselected_blockers(
+    conn,
+    *,
+    dag_id: str | None,
+    now_iso: str,
+    selected: list[PlanSelection],
+    skips: dict[str, PlanBlocker],
+) -> list[PlanBlocker]:
+    """汇总未选中 pending 任务的首个阻塞原因，按 rowid 稳定排序输出。
+
+    候选扫描已记录的原因（组满/能力不匹配/限额）优先；候选集外的 pending 行
+    按依赖 → 退避补齐。依赖前置的状态取模拟后快照：本批选中的 pending 前置
+    视为 running（与真实批量领取后的状态一致）。过期重领中的 running 任务
+    不属于 pending，即使在候选扫描中被跳过也不在此列。
+    """
+    selected_ids = {sel.row["id"] for sel in selected}
+
+    # 全部 pending 任务（候选集外的行在此补齐阻塞原因），按 rowid 稳定排序
+    pending_rows = conn.execute(
+        """SELECT t.rowid AS rowid, t.*
+           FROM tasks t
+           WHERE (:dag_id IS NULL OR t.dag_id = :dag_id)
+             AND t.state = 'pending'
+           ORDER BY t.rowid""",
+        {"dag_id": dag_id},
+    ).fetchall()
+
+    # 依赖判定所需的 (dag_id, task_key) -> state：先取存储快照，再把本批
+    # 选中的 pending 任务视为 running（与真实批量领取后的状态一致）
+    task_states: dict[tuple[str, str], str] = {
+        (r["dag_id"], r["task_key"]): r["state"]
+        for r in conn.execute(
+            "SELECT dag_id, task_key, state FROM tasks"
+        ).fetchall()
+    }
+    for sel in selected:
+        task_states[(sel.row["dag_id"], sel.row["task_key"])] = RUNNING
+    deps_by_task: dict[tuple[str, str], list[str]] = {}
+    for d in conn.execute(
+        "SELECT dag_id, task_key, dep_key FROM dependencies ORDER BY dag_id, task_key, dep_key"
+    ).fetchall():
+        deps_by_task.setdefault((d["dag_id"], d["task_key"]), []).append(d["dep_key"])
+
+    blockers: dict[str, PlanBlocker] = dict(skips)
+    for prow in pending_rows:
+        if prow["id"] in selected_ids or prow["id"] in blockers:
+            continue
+        entry = _pending_blocker(prow, now_iso, task_states, deps_by_task)
+        if entry is not None:
+            blockers[prow["id"]] = entry
+
+    # 只输出未选中的 pending 任务（过期重领中的 running 任务不属于 pending，
+    # 即使在候选扫描中被跳过也不在此列），按 rowid 稳定排序
+    return [
+        blockers[prow["id"]]
+        for prow in pending_rows
+        if prow["id"] not in selected_ids and prow["id"] in blockers
+    ]
+
+
+def serialize_claim_plan(plan: ClaimPlan) -> dict[str, Any]:
+    """把不可变批次计划序列化为 /tasks/claim-plan 的响应体（唯一序列化点）。
+
+    选中项与真实领取响应同构，但不携带租约令牌（预演不签发令牌）；
+    未选中项携带首个阻塞原因码、人类可读说明与原因相关字段。
+    """
+    claimed = [
+        {
+            "task_id": sel.row["id"],
+            "dag_id": sel.row["dag_id"],
+            "task_key": sel.row["task_key"],
+            "name": sel.row["name"],
+            "payload": json.loads(sel.row["payload"]) if sel.row["payload"] else None,
+            "attempt": sel.attempt_no,
+            # 预演不产生真实租约：lease_token 缺省；lease_expires_at 仅为按
+            # 计划时刻 + lease_seconds 模拟的结果，真实领取时刻不同会得到不同值
+            "lease_token": None,
+            "lease_expires_at": _iso(sel.expires),
+            "lease_seconds": sel.row["lease_seconds"],
+            "concurrency_group": sel.row["concurrency_group"],
+            "requires": list(sel.required),
+        }
+        for sel in plan.selected
+    ]
+    unselected = [
+        {
+            "task_id": blocker.task_id,
+            "dag_id": blocker.dag_id,
+            "task_key": blocker.task_key,
+            "name": blocker.name,
+            "reason": blocker.reason,
+            "message": _PLAN_REASON_MESSAGES[blocker.reason],
+            **blocker.extra,
+        }
+        for blocker in plan.unselected
+    ]
+    return {
+        "simulated": True,
+        "worker_id": plan.worker_id,
+        "dag_id": plan.dag_id,
+        "limit": plan.limit,
+        "evaluated_at": plan.evaluated_at,
+        "claimed": claimed,
+        "count": len(claimed),
+        "unselected": unselected,
+    }
+
+
+def apply_claim_plan(conn, plan: ClaimPlan, now_iso: str) -> list[dict[str, Any]]:
+    """在调用方的 BEGIN IMMEDIATE 事务内应用计划：逐选中项生成租约令牌、
+    attempt 行与 task.claimed 事件，返回与领取响应同构的 claimed 列表。
+
+    每条任务 UPDATE 都以计划快照为前置（id + state + attempt 必须仍匹配）：
+    任一不匹配说明计划所依据的状态已被改动，抛 409 claim_plan_stale 由调用方
+    整体回滚——不得部分领取。（BEGIN IMMEDIATE 保留锁下并发写不可能介入，
+    该校验是对存储一致性的防御性断言。）
+    """
+    claimed: list[dict[str, Any]] = []
+    for sel in plan.selected:
+        row = sel.row
+        token = uuid.uuid4().hex
+
+        # 旧尝试（若存在）标记过期，保证历史尝试不再有效
+        conn.execute(
+            "UPDATE attempts SET state = 'expired' WHERE task_id = ? AND state = 'active'",
+            (row["id"],),
+        )
+        cur = conn.execute(
+            """UPDATE tasks
+               SET state = 'running', attempt = ?, lease_token = ?,
+                   lease_expires_at = ?, worker_id = ?, started_at = COALESCE(started_at, ?),
+                   next_eligible_at = NULL
+               WHERE id = ? AND state = ? AND attempt = ?""",
+            (
+                sel.attempt_no,
+                token,
+                _iso(sel.expires),
+                plan.worker_id,
+                now_iso,
+                row["id"],
+                row["state"],
+                row["attempt"],
+            ),
+        )
+        if cur.rowcount != 1:
+            # 计划快照与存储不一致：整体回滚，不得部分领取
+            raise APIError(
+                409,
+                "claim_plan_stale",
+                "领取计划所依据的任务状态已变化，整批领取已回滚，请重试",
+                {"task_id": row["id"], "task_key": row["task_key"], "dag_id": row["dag_id"]},
+            )
+        conn.execute(
+            """INSERT INTO attempts (task_id, attempt_no, lease_token, worker_id,
+                   leased_at, expires_at, state)
+               VALUES (?, ?, ?, ?, ?, ?, 'active')""",
+            (row["id"], sel.attempt_no, token, plan.worker_id, now_iso, _iso(sel.expires)),
+        )
+        # task.claimed 与领取状态变更同事务；attempt=0 为首次领取，否则为过期重领
+        _append_event(
+            conn,
+            EVT_TASK_CLAIMED,
+            row["dag_id"],
+            now_iso,
+            task_id=row["id"],
+            attempt=sel.attempt_no,
+            from_state=PENDING if row["attempt"] == 0 else row["state"],
+            to_state=RUNNING,
+        )
+        claimed.append(
+            {
+                "task_id": row["id"],
+                "dag_id": row["dag_id"],
+                "task_key": row["task_key"],
+                "name": row["name"],
+                "payload": json.loads(row["payload"]) if row["payload"] else None,
+                "attempt": sel.attempt_no,
+                "lease_token": token,
+                "lease_expires_at": _iso(sel.expires),
+                "lease_seconds": row["lease_seconds"],
+                "concurrency_group": row["concurrency_group"],
+                "requires": list(sel.required),
+            }
+        )
+    return claimed
+
+
+# ---------------------------------------------------------------- 原子领取
+
+def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[str, Any]:
+    now = _now()
+    now_iso = _iso(now)
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")  # 保留锁：同一时刻只有一个领取者
+        try:
+            # 裁决内核在同一保留事务内构建不可变批次计划（能力登记、依赖、退避、
+            # 并发组占用均取该事务的一致快照），随后应用同一计划落库：任一写入
+            # 前置状态不匹配即整体回滚，不得部分领取。
+            plan = build_claim_plan(
+                conn, worker_id=worker_id, dag_id=dag_id, limit=limit, now=now
+            )
+            claimed = apply_claim_plan(conn, plan, now_iso)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return {"claimed": claimed, "count": len(claimed)}
+
+
+# ---------------------------------------------------------------- 领取预演（只读）
 
 def plan_claims(worker_id: str | None, dag_id: str | None, limit: int) -> dict[str, Any]:
     """只读的任务领取决策预演：POST /tasks/claim-plan 的业务实现。
 
-    完全沿用真实领取的候选排序（rowid）与依赖、退避、并发组、工作器能力门控，
-    在单个 SQLite 只读事务的一致快照上完成：
+    在单个 SQLite 只读事务的一致快照上运行裁决内核，构建与真实领取完全相同的
+    不可变批次计划，随后仅序列化该计划返回：
       - 不写入任务、attempt 或事件（连接置 query_only 兜底，结束以 ROLLBACK 收尾）；
-      - 同一批次内模拟选中的任务即时占用并发组容量，使选中序列与同一快照下的
-        真实批量领取一致；
-      - 返回按顺序模拟选中的任务（无真实租约令牌），并为每个未选中的 pending
-        任务给出首个阻塞原因及相关字段。
-    请求参数与 claim_tasks 一致；dag_id 不存在返回 404；requires 候选遇到无存活
-    登记的领取者同样返回 409 worker_not_registered（与真实领取同语义，不落任何写入）。
+      - 选中序列与同一快照下的真实批量领取一致（同批选中即时占用并发组容量）；
+      - 选中项不签发真实租约令牌，未选中 pending 任务携带首个阻塞原因。
+    dag_id 不存在返回 404；requires 候选遇到无存活登记的领取者同样返回
+    409 worker_not_registered（与真实领取同语义，不落任何写入）。
     """
-    now = _now()
-    now_iso = _iso(now)
-
     with get_conn() as conn:
         # 兜底：整次预演只读，任何意外写操作都会被 SQLite 直接拒绝
         conn.execute("PRAGMA query_only = ON")
         conn.execute("BEGIN")  # 只读事务：本次预演的所有读取看到同一快照
         try:
-            if dag_id is not None and not conn.execute(
-                "SELECT 1 FROM dags WHERE id = ?", (dag_id,)
-            ).fetchone():
-                raise APIError(404, "dag_not_found", f"DAG {dag_id} 不存在")
-
-            worker_caps = _load_worker_caps(conn, worker_id, now_iso)
-            limits, occupied = _load_group_snapshot(conn, now_iso)
-
-            selected: list[tuple[Any, list[str], int, datetime]] = []
-            candidate_skips: dict[str, dict[str, Any]] = {}
-
-            def on_select(row, required: list[str], attempt_no: int, expires: datetime) -> None:
-                selected.append((row, required, attempt_no, expires))
-
-            def on_skip(row, reason: str, extra: dict[str, Any]) -> None:
-                candidate_skips[row["id"]] = {
-                    "task_id": row["id"],
-                    "dag_id": row["dag_id"],
-                    "task_key": row["task_key"],
-                    "name": row["name"],
-                    "reason": reason,
-                    "message": _PLAN_REASON_MESSAGES[reason],
-                    **extra,
-                }
-
-            _scan_claimable_candidates(
-                conn,
-                dag_id=dag_id,
-                now=now,
-                now_iso=now_iso,
-                limit=limit,
-                worker_id=worker_id,
-                worker_caps=worker_caps,
-                limits=limits,
-                occupied=occupied,
-                on_select=on_select,
-                collect_skips=True,
-                on_skip=on_skip,
+            plan = build_claim_plan(
+                conn, worker_id=worker_id, dag_id=dag_id, limit=limit, now=_now()
             )
-
-            selected_ids = {row["id"] for row, _r, _a, _e in selected}
-
-            # 全部 pending 任务（候选集外的行在此补齐阻塞原因），按 rowid 稳定排序
-            pending_rows = conn.execute(
-                """SELECT t.rowid AS rowid, t.*
-                   FROM tasks t
-                   WHERE (:dag_id IS NULL OR t.dag_id = :dag_id)
-                     AND t.state = 'pending'
-                   ORDER BY t.rowid""",
-                {"dag_id": dag_id},
-            ).fetchall()
-
-            # 依赖判定所需的（dag_id, task_key) -> state：先取存储快照，再把本批
-            # 模拟选中的 pending 任务视为 running（与真实批量领取后的状态一致）
-            task_states: dict[tuple[str, str], str] = {
-                (r["dag_id"], r["task_key"]): r["state"]
-                for r in conn.execute(
-                    "SELECT dag_id, task_key, state FROM tasks"
-                ).fetchall()
-            }
-            for row, _r, _a, _e in selected:
-                task_states[(row["dag_id"], row["task_key"])] = RUNNING
-            deps_by_task: dict[tuple[str, str], list[str]] = {}
-            for d in conn.execute(
-                "SELECT dag_id, task_key, dep_key FROM dependencies ORDER BY dag_id, task_key, dep_key"
-            ).fetchall():
-                deps_by_task.setdefault((d["dag_id"], d["task_key"]), []).append(d["dep_key"])
-
-            # 未选中原因表：候选扫描产生的组满/能力不匹配/限额原因优先，
-            # 其余 pending 行按依赖 → 退避补齐首个阻塞原因
-            reasons = dict(candidate_skips)
-            for prow in pending_rows:
-                if prow["id"] in selected_ids or prow["id"] in reasons:
-                    continue
-                entry = _plan_pending_blocker(prow, now_iso, task_states, deps_by_task)
-                if entry is not None:
-                    reasons[prow["id"]] = entry
-
-            # 未选中列表按 rowid 排序输出（只含 pending 任务；过期重领中的 running
-            # 任务不属于 pending，即使在候选扫描中被跳过也不在此列）
-            unselected = [
-                reasons[prow["id"]]
-                for prow in pending_rows
-                if prow["id"] not in selected_ids and prow["id"] in reasons
-            ]
-
-            claimed = [
-                _plan_selected_dict(row, required, attempt_no, expires)
-                for row, required, attempt_no, expires in selected
-            ]
-            result = {
-                "simulated": True,
-                "worker_id": worker_id,
-                "dag_id": dag_id,
-                "limit": limit,
-                "evaluated_at": now_iso,
-                "claimed": claimed,
-                "count": len(claimed),
-                "unselected": unselected,
-            }
+            result = serialize_claim_plan(plan)
         finally:
             conn.execute("ROLLBACK")  # 纯读取：不提交任何变更
 
